@@ -4,7 +4,10 @@ Canvas Course Downloader
 Downloads a Canvas LMS course into a structured Markdown file.
 
 Usage:
-    python canvas_course_downloader.py [output_file.md]
+    python canvas_course_downloader.py [output_file.md] [OPTIONS]
+
+Options:
+    --reset-token   Force re-prompt for API token and update Keychain
 
 The output file can be edited and re-uploaded using canvas_course_builder.py
 """
@@ -12,7 +15,8 @@ The output file can be edited and re-uploaded using canvas_course_builder.py
 import re
 import sys
 import requests
-from datetime import datetime
+import keyring
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Optional
 from html.parser import HTMLParser
@@ -38,6 +42,8 @@ class HTMLToMarkdown(HTMLParser):
         self.in_list = False
         self.list_type = None
         self.list_index = 0
+        self.in_file_link = False
+        self.file_link_text = []
         
     def handle_starttag(self, tag, attrs):
         attrs_dict = dict(attrs)
@@ -52,7 +58,13 @@ class HTMLToMarkdown(HTMLParser):
             self.result.append('*')
         elif tag == 'a':
             self.current_href = attrs_dict.get('href', '')
-            self.result.append('[')
+            # Check if this is a Canvas file link
+            if self.current_href and '/files/' in self.current_href:
+                self.in_file_link = True
+                self.file_link_text = []
+                self.result.append('[[File:')
+            else:
+                self.result.append('[')
         elif tag == 'img':
             alt = attrs_dict.get('alt', 'image')
             src = attrs_dict.get('src', '')
@@ -95,7 +107,14 @@ class HTMLToMarkdown(HTMLParser):
         elif tag == 'em' or tag == 'i':
             self.result.append('*')
         elif tag == 'a':
-            self.result.append(f']({self.current_href})')
+            if self.in_file_link:
+                # Close the [[File:...]] format
+                self.result.append(']]')
+                self.in_file_link = False
+                self.file_link_text = []
+            else:
+                # Regular link
+                self.result.append(f']({self.current_href})')
             self.current_href = None
         elif tag in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
             self.result.append('\n')
@@ -138,6 +157,60 @@ def html_to_markdown(html: str) -> str:
     except:
         # If parsing fails, strip tags crudely
         return re.sub(r'<[^>]+>', '', html).strip()
+
+
+# =============================================================================
+# Keychain Token Storage
+# =============================================================================
+
+KEYCHAIN_SERVICE = "canvas-course-builder"
+
+def get_keychain_username(canvas_url: str, course_id: str) -> str:
+    """Generate unique username for keychain entry."""
+    # Normalize URL (remove trailing slash)
+    url = canvas_url.rstrip('/')
+    return f"{url}:{course_id}"
+
+def get_token_from_keychain(canvas_url: str, course_id: str) -> Optional[str]:
+    """
+    Retrieve API token from system keychain.
+
+    Returns:
+        Token string if found, None otherwise
+    """
+    username = get_keychain_username(canvas_url, course_id)
+    try:
+        token = keyring.get_password(KEYCHAIN_SERVICE, username)
+        return token
+    except Exception as e:
+        # Keychain access failed - fall back to prompt
+        print(f"  Warning: Could not access Keychain: {e}")
+        return None
+
+def save_token_to_keychain(canvas_url: str, course_id: str, token: str) -> bool:
+    """
+    Save API token to system keychain.
+
+    Returns:
+        True if saved successfully, False otherwise
+    """
+    username = get_keychain_username(canvas_url, course_id)
+    try:
+        keyring.set_password(KEYCHAIN_SERVICE, username, token)
+        return True
+    except Exception as e:
+        print(f"  Warning: Could not save to Keychain: {e}")
+        return False
+
+def delete_token_from_keychain(canvas_url: str, course_id: str) -> bool:
+    """Delete API token from system keychain."""
+    username = get_keychain_username(canvas_url, course_id)
+    try:
+        keyring.delete_password(KEYCHAIN_SERVICE, username)
+        return True
+    except Exception as e:
+        print(f"  Warning: Could not delete from Keychain: {e}")
+        return False
 
 
 # =============================================================================
@@ -389,8 +462,10 @@ class CourseExporter:
             due_at = assignment.get("due_at")
             if due_at:
                 try:
+                    # Parse as UTC and convert to local timezone
                     dt = datetime.fromisoformat(due_at.replace('Z', '+00:00'))
-                    lines.append(f"due: {dt.strftime('%Y-%m-%d %I:%M%p').lower()}")
+                    dt_local = dt.astimezone()  # Convert to local timezone
+                    lines.append(f"due: {dt_local.strftime('%Y-%m-%d %I:%M%p').lower()}")
                 except:
                     pass
             
@@ -461,8 +536,10 @@ class CourseExporter:
                 due_at = assignment.get("due_at")
                 if due_at:
                     try:
+                        # Parse as UTC and convert to local timezone
                         dt = datetime.fromisoformat(due_at.replace('Z', '+00:00'))
-                        lines.append(f"due: {dt.strftime('%Y-%m-%d %I:%M%p').lower()}")
+                        dt_local = dt.astimezone()  # Convert to local timezone
+                        lines.append(f"due: {dt_local.strftime('%Y-%m-%d %I:%M%p').lower()}")
                     except:
                         pass
                 
@@ -497,10 +574,17 @@ def main():
     print("=" * 60)
     print("Canvas Course Downloader")
     print("=" * 60)
-    
-    # Get output filename
-    output_file = sys.argv[1] if len(sys.argv) > 1 else "course_content.md"
-    
+
+    # Parse command line arguments
+    output_file = "course_content.md"
+    reset_token = False
+
+    for arg in sys.argv[1:]:
+        if arg == "--reset-token":
+            reset_token = True
+        elif not arg.startswith("--"):
+            output_file = arg
+
     # Get Canvas URL
     canvas_url = DEFAULT_CANVAS_URL
     if not canvas_url:
@@ -520,12 +604,40 @@ def main():
             print("Error: Course ID is required.")
             sys.exit(1)
     
-    # Get API token
-    api_token = input("Enter your Canvas API token: ").strip()
-    if not api_token:
-        print("Error: No token provided.")
-        sys.exit(1)
-    
+    # Get API token (with keychain support)
+    api_token = None
+
+    # Try to retrieve from Keychain (unless --reset-token flag is set)
+    if not reset_token:
+        api_token = get_token_from_keychain(canvas_url, course_id)
+        if api_token:
+            print(f"\n✓ Using API token from Keychain")
+            print(f"  Course: {canvas_url}/courses/{course_id}")
+
+    # Prompt for token if not found in Keychain OR reset requested
+    if not api_token or reset_token:
+        if reset_token:
+            print("\n• Resetting API token (--reset-token flag)")
+            # Delete old token from Keychain if exists
+            delete_token_from_keychain(canvas_url, course_id)
+        else:
+            print(f"\nNo saved token found in Keychain for this course.")
+
+        # Prompt for token
+        api_token = input("Enter your Canvas API token: ").strip()
+        if not api_token:
+            print("Error: No token provided.")
+            sys.exit(1)
+
+        # Save to Keychain for future use
+        print("\nSaving token to Keychain...", end=" ")
+        if save_token_to_keychain(canvas_url, course_id, api_token):
+            print("✓ Saved")
+            print(f"  (Next time, token will be retrieved automatically)")
+        else:
+            print("✗ Failed")
+            print(f"  (You will be prompted again next time)")
+
     print(f"\nCourse: {canvas_url}/courses/{course_id}")
     print(f"Output: {output_file}")
     print("=" * 60)
